@@ -1,0 +1,120 @@
+lane_follow:
+  ros__parameters:
+    # Phase 1: camera input and original-frame debug output only.
+    image_topic: /camera/image_raw
+    debug_original_topic: /lane/debug/original
+    debug_roi_topic: /lane/debug/roi
+    debug_birdseye_topic: /lane/debug/birdseye
+    debug_mask_topic: /lane/debug/mask
+    debug_white_mask_topic: /lane/debug/white_mask
+    debug_path_topic: /lane/debug/path
+    speed_topic: /speed
+    steering_topic: /steering
+    obstacle_topic: /obstacles
+
+    # Phase 2: normalized trapezoid ROI. These initial values were selected
+    # from the current 480x360 simulator camera frame.
+    roi_top_y_ratio: 0.557
+    roi_bottom_y_ratio: 0.822
+    roi_top_left_x_ratio: 0.404
+    roi_top_right_x_ratio: 0.596
+    roi_bottom_left_x_ratio: 0.021
+    roi_bottom_right_x_ratio: 0.979
+    roi_line_thickness: 2
+
+    # Phase 3: perspective destination and BEV image dimensions. Source points
+    # are the ROI corners above; destination values are normalized ratios.
+    bev_output_width: 480
+    bev_output_height: 360
+    perspective_dst_top_y_ratio: 0.00
+    perspective_dst_bottom_y_ratio: 1.00
+    perspective_dst_top_left_x_ratio: 0.12
+    perspective_dst_top_right_x_ratio: 0.88
+    perspective_dst_bottom_left_x_ratio: 0.12
+    perspective_dst_bottom_right_x_ratio: 0.88
+
+    # Phase 4: OpenCV HSV uses H=[0,179], S/V=[0,255]. Current simulator
+    # orange center-line samples are concentrated near H=18.
+    orange_h_min: 10
+    orange_h_max: 28
+    orange_s_min: 90
+    orange_s_max: 255
+    orange_v_min: 80
+    orange_v_max: 255
+    orange_open_kernel: 3
+    orange_close_kernel: 5
+    orange_morphology_iterations: 1
+
+    # Phase 7: low-saturation, high-value road-boundary fallback.
+    white_s_max: 80
+    white_v_min: 160
+    white_open_kernel: 3
+    white_close_kernel: 5
+    white_morphology_iterations: 1
+    white_minimum_pixels_per_bin: 5
+    white_minimum_lane_width_ratio: 0.45
+    white_maximum_lane_width_ratio: 1.55
+
+    # Phase 5: dashed-line aggregation and 2D spline / x(y) fallback fitting. The BEV forward
+    # range is a calibration parameter, not a silently assumed vehicle value.
+    polynomial_degree: 2
+    min_component_area_px: 12
+    max_component_area_px: 20000
+    path_row_bin_height_px: 8
+    min_detection_points: 5
+    fit_max_residual_px: 18.0
+    path_sample_step_px: 6
+    lookahead_distance_m: 0.60
+    bev_forward_range_m: 1.50
+    # 0.70 m is verified from the route center-to-boundary geometry in this repo.
+    lane_width_m: 0.70
+    component_chain_max_gap_m: 0.45
+    spline_sample_spacing_m: 0.02
+    minimum_lane_confidence: 0.35
+
+    # Phase 6: Pure Pursuit. Disabled by default so perception can be checked
+    # before the first motion. Wheelbase and limits are verified from the
+    # existing URDF, real driver and simulator adapter.
+    control_enabled: false
+    adaptive_speed_enabled: true
+    wheelbase_m: 0.18
+    max_steering_rad: 0.349066
+    max_steering_rate_rad_s: 1.80 #1.50
+    test_speed_mps: 1.10 #0.40 
+    min_speed_mps: 0.60 
+    max_speed_mps: 1.3  #0.50
+    steering_slowdown_threshold_rad: 0.10
+    curvature_slowdown_gain: 0.80
+    tracking_lane_confidence: 0.45
+    low_confidence_speed_mps: 0.20
+    previous_path_hold_sec: 0.35
+    lost_frame_threshold: 5
+    min_lookahead_distance_m: 0.25  #0.35 ->      -> 0.25
+    max_lookahead_distance_m: 0.45 #0.65  -> 0.60 -> 0.45
+    lookahead_speed_gain: 0.40  #0.55   ->       -> 0.40
+    minimum_target_distance_m: 0.10
+
+    # Phase 10: local path offset. Obstacles are never accumulated into a map.
+    obstacle_avoidance_enabled: true
+    obstacle_timeout_sec: 0.60
+    obstacle_min_forward_m: 0.25
+    obstacle_passed_forward_m: -0.25
+    obstacle_detection_distance_m: 1.50
+    # Clearance beyond obstacle radius: wheel outer half-width (0.1175 m)
+    # verified from the simulator model, plus margin.
+    obstacle_safety_distance_m: 0.14   #장애물 주변 추가 안전 여유 
+    avoidance_lateral_offset_m: 0.20  #장애물 회피시 차선 offset #0.27
+    avoidance_offset_rate_mps: 0.35
+    # Track one cone until it leaves the front scan, then choose a fresh side
+    # for the next cone. This is required for alternating slalom placement.
+    obstacle_clear_time_sec: 0.25
+    avoidance_return_distance_m: 0.80  #회피 후 원래 차선으로 돌아가는 거리 
+    obstacle_association_distance_m: 0.30
+    obstacle_active_lost_timeout_sec: 0.25
+    avoidance_speed_mps: 0.60  # 장애물 회피 속도 0.25
+    preferred_avoidance_side: left
+
+    # Diagnostics.
+    frame_timeout_sec: 1.0
+    timing_log_enabled: false
+    timing_log_period_sec: 2.0

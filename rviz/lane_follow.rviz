@@ -1,0 +1,81 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+  - Class: rviz_common/Selection
+    Name: Selection
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Lane Debug Image
+      Normalize Range: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Filter size: 1
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /lane/debug/path
+      Value: true
+    - Alpha: 0.35
+      Cell Size: 0.5
+      Class: rviz_default_plugins/Grid
+      Color: 100; 100; 100
+      Enabled: true
+      Name: Ground Grid
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Alpha: 0.55
+      Class: rviz_default_plugins/LaserScan
+      Color: 80; 200; 255
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: true
+      Name: Front LiDAR
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.02
+      Style: Flat Squares
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Filter size: 1
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /scan
+      Use Fixed Frame: true
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Obstacle Clusters
+      Namespaces:
+        obstacle_clusters: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Filter size: 1
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /obstacle/debug/markers
+      Value: true
+  Enabled: true
+  Global Options:
+    Background Color: 32; 32; 32
+    Fixed Frame: base_footprint
+    Frame Rate: 30
+  Name: root
+  Tools: []
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+Window Geometry:
+  Height: 720
+  Width: 960

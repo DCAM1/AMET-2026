@@ -1,0 +1,24 @@
+lidar_obstacle:
+  ros__parameters:
+    # Verified repository contract: sensor_msgs/LaserScan on /scan,
+    # lidar_link frame, 0.1/0.15 to 16 m depending on real/sim source.
+    scan_topic: /scan
+    obstacle_topic: /obstacles
+    marker_topic: /obstacle/debug/markers
+
+    # Front-only local perception; no SLAM or accumulated map.
+    angle_min_deg: -75.0
+    angle_max_deg: 75.0
+    range_min_m: 0.15
+    range_max_m: 3.0
+
+    # Sequential Euclidean clustering exploits LaserScan angular ordering and
+    # avoids the memory/CPU cost of a general point-cloud DBSCAN.
+    cluster_distance_m: 0.12
+    minimum_cluster_size: 3
+    minimum_cluster_width_m: 0.01
+    maximum_cluster_width_m: 0.80
+
+    scan_timeout_sec: 1.0
+    timing_log_enabled: false
+    timing_log_period_sec: 2.0
