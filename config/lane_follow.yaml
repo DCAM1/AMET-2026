@@ -55,6 +55,29 @@ lane_follow:
     white_minimum_lane_width_ratio: 0.45
     white_maximum_lane_width_ratio: 1.55
 
+    # Start-line traffic-light gate. The car stays stopped for RED, YELLOW or
+    # UNKNOWN and releases only after consecutive GREEN detections. Ratios are
+    # normalized against the original 480x360 camera image.
+    traffic_light_gate_enabled: true
+    traffic_light_roi_left_ratio: 0.68
+    traffic_light_roi_right_ratio: 0.95
+    traffic_light_roi_top_ratio: 0.35
+    traffic_light_roi_bottom_ratio: 0.75
+    traffic_light_red_hue_low_max: 10
+    traffic_light_red_hue_high_min: 170
+    traffic_light_green_hue_min: 40
+    traffic_light_green_hue_max: 90
+    traffic_light_saturation_min: 150
+    traffic_light_value_min: 140
+    traffic_light_dark_value_max: 90
+    traffic_light_component_area_min_px: 20
+    traffic_light_component_area_max_px: 2000
+    traffic_light_component_aspect_min: 0.65
+    traffic_light_component_aspect_max: 1.40
+    traffic_light_component_fill_min: 0.55
+    traffic_light_dark_surround_min: 0.25
+    traffic_light_green_confirm_frames: 5
+
     # Phase 5: dashed-line aggregation and 2D spline / x(y) fallback fitting. The BEV forward
     # range is a calibration parameter, not a silently assumed vehicle value.
     polynomial_degree: 2

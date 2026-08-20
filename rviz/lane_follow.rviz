@@ -21,6 +21,21 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /lane/debug/path
       Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Traffic Light Debug
+      Normalize Range: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Filter size: 1
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /lane/debug/original
+      Value: true
     - Alpha: 0.35
       Cell Size: 0.5
       Class: rviz_default_plugins/Grid

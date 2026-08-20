@@ -155,6 +155,37 @@ struct ControlConfig
   double minimum_target_distance_m{0.10};
 };
 
+struct TrafficLightConfig
+{
+  bool enabled{true};
+  double roi_left_ratio{0.68};
+  double roi_right_ratio{0.95};
+  double roi_top_ratio{0.35};
+  double roi_bottom_ratio{0.75};
+  int red_hue_low_max{10};
+  int red_hue_high_min{170};
+  int green_hue_min{40};
+  int green_hue_max{90};
+  int saturation_min{150};
+  int value_min{140};
+  int dark_value_max{90};
+  int component_area_min_px{20};
+  int component_area_max_px{2000};
+  double component_aspect_min{0.65};
+  double component_aspect_max{1.40};
+  double component_fill_min{0.55};
+  double dark_surround_min{0.25};
+  int green_confirm_frames{5};
+};
+
+struct TrafficLampDetection
+{
+  bool valid{false};
+  cv::Rect bounding_box;
+  int area_px{0};
+  double dark_surround_ratio{0.0};
+};
+
 class LaneFollowNode : public rclcpp::Node
 {
 public:
@@ -258,6 +289,53 @@ public:
       throw std::invalid_argument("Invalid white mask parameters: " + white_error);
     }
     update_white_morphology_kernels();
+
+    traffic_light_.enabled = declare_parameter<bool>(
+      "traffic_light_gate_enabled", true);
+    traffic_light_.roi_left_ratio = declare_parameter<double>(
+      "traffic_light_roi_left_ratio", 0.68);
+    traffic_light_.roi_right_ratio = declare_parameter<double>(
+      "traffic_light_roi_right_ratio", 0.95);
+    traffic_light_.roi_top_ratio = declare_parameter<double>(
+      "traffic_light_roi_top_ratio", 0.35);
+    traffic_light_.roi_bottom_ratio = declare_parameter<double>(
+      "traffic_light_roi_bottom_ratio", 0.75);
+    traffic_light_.red_hue_low_max = declare_parameter<int>(
+      "traffic_light_red_hue_low_max", 10);
+    traffic_light_.red_hue_high_min = declare_parameter<int>(
+      "traffic_light_red_hue_high_min", 170);
+    traffic_light_.green_hue_min = declare_parameter<int>(
+      "traffic_light_green_hue_min", 40);
+    traffic_light_.green_hue_max = declare_parameter<int>(
+      "traffic_light_green_hue_max", 90);
+    traffic_light_.saturation_min = declare_parameter<int>(
+      "traffic_light_saturation_min", 150);
+    traffic_light_.value_min = declare_parameter<int>(
+      "traffic_light_value_min", 140);
+    traffic_light_.dark_value_max = declare_parameter<int>(
+      "traffic_light_dark_value_max", 90);
+    traffic_light_.component_area_min_px = declare_parameter<int>(
+      "traffic_light_component_area_min_px", 20);
+    traffic_light_.component_area_max_px = declare_parameter<int>(
+      "traffic_light_component_area_max_px", 2000);
+    traffic_light_.component_aspect_min = declare_parameter<double>(
+      "traffic_light_component_aspect_min", 0.65);
+    traffic_light_.component_aspect_max = declare_parameter<double>(
+      "traffic_light_component_aspect_max", 1.40);
+    traffic_light_.component_fill_min = declare_parameter<double>(
+      "traffic_light_component_fill_min", 0.55);
+    traffic_light_.dark_surround_min = declare_parameter<double>(
+      "traffic_light_dark_surround_min", 0.25);
+    traffic_light_.green_confirm_frames = declare_parameter<int>(
+      "traffic_light_green_confirm_frames", 5);
+    std::string traffic_light_error;
+    if (!validate_traffic_light(traffic_light_, traffic_light_error)) {
+      throw std::invalid_argument(
+              "Invalid traffic light parameters: " + traffic_light_error);
+    }
+    traffic_open_kernel_ = cv::getStructuringElement(
+      cv::MORPH_ELLIPSE, cv::Size(3, 3));
+    reset_traffic_light_gate();
 
     path_detection_.polynomial_degree = declare_parameter<int>(
       "polynomial_degree", 2);
@@ -547,6 +625,70 @@ private:
     return true;
   }
 
+  static bool validate_traffic_light(
+    const TrafficLightConfig & traffic_light, std::string & reason)
+  {
+    const std::array<double, 4> roi_ratios = {
+      traffic_light.roi_left_ratio,
+      traffic_light.roi_right_ratio,
+      traffic_light.roi_top_ratio,
+      traffic_light.roi_bottom_ratio,
+    };
+    if (std::any_of(roi_ratios.begin(), roi_ratios.end(), [](double value) {
+        return value < 0.0 || value > 1.0;
+      }) ||
+      traffic_light.roi_left_ratio >= traffic_light.roi_right_ratio ||
+      traffic_light.roi_top_ratio >= traffic_light.roi_bottom_ratio)
+    {
+      reason = "traffic-light ROI ratios must be ordered within [0, 1]";
+      return false;
+    }
+    if (traffic_light.red_hue_low_max < 0 || traffic_light.red_hue_low_max > 30 ||
+      traffic_light.red_hue_high_min < 150 || traffic_light.red_hue_high_min > 179 ||
+      traffic_light.green_hue_min < 0 ||
+      traffic_light.green_hue_max > 179 ||
+      traffic_light.green_hue_min >= traffic_light.green_hue_max)
+    {
+      reason = "traffic-light hue thresholds are outside OpenCV HSV bounds";
+      return false;
+    }
+    if (traffic_light.saturation_min < 0 || traffic_light.saturation_min > 255 ||
+      traffic_light.value_min < 0 || traffic_light.value_min > 255 ||
+      traffic_light.dark_value_max < 0 || traffic_light.dark_value_max > 255)
+    {
+      reason = "traffic-light S/V thresholds must be within [0, 255]";
+      return false;
+    }
+    if (traffic_light.component_area_min_px < 1 ||
+      traffic_light.component_area_max_px <= traffic_light.component_area_min_px)
+    {
+      reason = "traffic-light component areas must satisfy 1 <= min < max";
+      return false;
+    }
+    if (traffic_light.component_aspect_min <= 0.0 ||
+      traffic_light.component_aspect_max < traffic_light.component_aspect_min ||
+      traffic_light.component_aspect_max > 5.0)
+    {
+      reason = "traffic-light component aspect bounds are invalid";
+      return false;
+    }
+    if (traffic_light.component_fill_min < 0.0 ||
+      traffic_light.component_fill_min > 1.0 ||
+      traffic_light.dark_surround_min < 0.0 ||
+      traffic_light.dark_surround_min > 1.0)
+    {
+      reason = "traffic-light fill/dark-surround ratios must be within [0, 1]";
+      return false;
+    }
+    if (traffic_light.green_confirm_frames < 1 ||
+      traffic_light.green_confirm_frames > 100)
+    {
+      reason = "traffic_light_green_confirm_frames must be within [1, 100]";
+      return false;
+    }
+    return true;
+  }
+
   static bool validate_path_detection(
     const PathDetectionConfig & path, std::string & reason)
   {
@@ -781,6 +923,7 @@ private:
     PerspectiveConfig candidate_perspective = perspective_;
     OrangeMaskConfig candidate_orange_mask = orange_mask_;
     WhiteMaskConfig candidate_white_mask = white_mask_;
+    TrafficLightConfig candidate_traffic_light = traffic_light_;
     PathDetectionConfig candidate_path_detection = path_detection_;
     ControlConfig candidate_control = control_;
     AvoidanceConfig candidate_avoidance = avoidance_;
@@ -870,6 +1013,47 @@ private:
         candidate_white_mask.minimum_lane_width_ratio = parameter.as_double();
       } else if (parameter.get_name() == "white_maximum_lane_width_ratio") {
         candidate_white_mask.maximum_lane_width_ratio = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_gate_enabled") {
+        candidate_traffic_light.enabled = parameter.as_bool();
+      } else if (parameter.get_name() == "traffic_light_roi_left_ratio") {
+        candidate_traffic_light.roi_left_ratio = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_roi_right_ratio") {
+        candidate_traffic_light.roi_right_ratio = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_roi_top_ratio") {
+        candidate_traffic_light.roi_top_ratio = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_roi_bottom_ratio") {
+        candidate_traffic_light.roi_bottom_ratio = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_red_hue_low_max") {
+        candidate_traffic_light.red_hue_low_max = static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_red_hue_high_min") {
+        candidate_traffic_light.red_hue_high_min = static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_green_hue_min") {
+        candidate_traffic_light.green_hue_min = static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_green_hue_max") {
+        candidate_traffic_light.green_hue_max = static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_saturation_min") {
+        candidate_traffic_light.saturation_min = static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_value_min") {
+        candidate_traffic_light.value_min = static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_dark_value_max") {
+        candidate_traffic_light.dark_value_max = static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_component_area_min_px") {
+        candidate_traffic_light.component_area_min_px =
+          static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_component_area_max_px") {
+        candidate_traffic_light.component_area_max_px =
+          static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "traffic_light_component_aspect_min") {
+        candidate_traffic_light.component_aspect_min = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_component_aspect_max") {
+        candidate_traffic_light.component_aspect_max = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_component_fill_min") {
+        candidate_traffic_light.component_fill_min = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_dark_surround_min") {
+        candidate_traffic_light.dark_surround_min = parameter.as_double();
+      } else if (parameter.get_name() == "traffic_light_green_confirm_frames") {
+        candidate_traffic_light.green_confirm_frames =
+          static_cast<int>(parameter.as_int());
       } else if (parameter.get_name() == "polynomial_degree") {
         candidate_path_detection.polynomial_degree = static_cast<int>(parameter.as_int());
       } else if (parameter.get_name() == "min_component_area_px") {
@@ -987,6 +1171,12 @@ private:
       result.reason = white_error;
       return result;
     }
+    std::string traffic_light_error;
+    if (!validate_traffic_light(candidate_traffic_light, traffic_light_error)) {
+      result.successful = false;
+      result.reason = traffic_light_error;
+      return result;
+    }
     std::string path_error;
     if (!validate_path_detection(candidate_path_detection, path_error)) {
       result.successful = false;
@@ -1034,6 +1224,15 @@ private:
     }
     orange_mask_ = candidate_orange_mask;
     white_mask_ = candidate_white_mask;
+    const bool traffic_gate_became_enabled =
+      !traffic_light_.enabled && candidate_traffic_light.enabled;
+    traffic_light_ = candidate_traffic_light;
+    if (traffic_gate_became_enabled) {
+      reset_traffic_light_gate();
+    } else if (!traffic_light_.enabled) {
+      traffic_green_released_ = true;
+      traffic_light_state_ = "DISABLED";
+    }
     path_detection_ = candidate_path_detection;
     const bool control_was_disabled = !control_.enabled && candidate_control.enabled;
     const bool control_was_enabled = control_.enabled && !candidate_control.enabled;
@@ -1048,6 +1247,7 @@ private:
     } else if (control_was_enabled) {
       publish_control(0.0, 0.0);
       controller_state_ = "DISABLED";
+      reset_traffic_light_gate();
       RCLCPP_INFO(get_logger(), "Vehicle control disabled; stop command published");
     }
     frame_timeout_sec_ = candidate_frame_timeout_sec;
@@ -1070,6 +1270,192 @@ private:
       cv::Point(pixel_x(roi_.bottom_right_x_ratio), pixel_y(roi_.bottom_y_ratio)),
       cv::Point(pixel_x(roi_.bottom_left_x_ratio), pixel_y(roi_.bottom_y_ratio)),
     };
+  }
+
+  cv::Rect traffic_light_roi(const cv::Size & image_size) const
+  {
+    const int left = static_cast<int>(std::lround(
+      traffic_light_.roi_left_ratio * static_cast<double>(image_size.width - 1)));
+    const int right = static_cast<int>(std::lround(
+      traffic_light_.roi_right_ratio * static_cast<double>(image_size.width - 1)));
+    const int top = static_cast<int>(std::lround(
+      traffic_light_.roi_top_ratio * static_cast<double>(image_size.height - 1)));
+    const int bottom = static_cast<int>(std::lround(
+      traffic_light_.roi_bottom_ratio * static_cast<double>(image_size.height - 1)));
+    return cv::Rect(
+      left, top, std::max(1, right - left + 1), std::max(1, bottom - top + 1));
+  }
+
+  TrafficLampDetection find_traffic_lamp_component(
+    const cv::Mat & mask, const cv::Mat & hsv_roi)
+  {
+    TrafficLampDetection best;
+    const int component_count = cv::connectedComponentsWithStats(
+      mask, traffic_component_labels_, traffic_component_stats_,
+      traffic_component_centroids_, 8, CV_32S);
+    for (int label = 1; label < component_count; ++label) {
+      const int area = traffic_component_stats_.at<int>(label, cv::CC_STAT_AREA);
+      const int x = traffic_component_stats_.at<int>(label, cv::CC_STAT_LEFT);
+      const int y = traffic_component_stats_.at<int>(label, cv::CC_STAT_TOP);
+      const int width = traffic_component_stats_.at<int>(label, cv::CC_STAT_WIDTH);
+      const int height = traffic_component_stats_.at<int>(label, cv::CC_STAT_HEIGHT);
+      if (area < traffic_light_.component_area_min_px ||
+        area > traffic_light_.component_area_max_px || width < 1 || height < 1)
+      {
+        continue;
+      }
+      const double aspect = static_cast<double>(width) / static_cast<double>(height);
+      const double fill = static_cast<double>(area) /
+        static_cast<double>(width * height);
+      if (aspect < traffic_light_.component_aspect_min ||
+        aspect > traffic_light_.component_aspect_max ||
+        fill < traffic_light_.component_fill_min)
+      {
+        continue;
+      }
+
+      const int margin = std::max(2, std::max(width, height) / 2);
+      const int surround_left = std::max(0, x - margin);
+      const int surround_top = std::max(0, y - margin);
+      const int surround_right = std::min(mask.cols, x + width + margin);
+      const int surround_bottom = std::min(mask.rows, y + height + margin);
+      int surround_pixels = 0;
+      int dark_pixels = 0;
+      for (int row = surround_top; row < surround_bottom; ++row) {
+        const auto * labels = traffic_component_labels_.ptr<int>(row);
+        const auto * hsv = hsv_roi.ptr<cv::Vec3b>(row);
+        for (int column = surround_left; column < surround_right; ++column) {
+          if (labels[column] == label) {
+            continue;
+          }
+          ++surround_pixels;
+          if (hsv[column][2] <= traffic_light_.dark_value_max) {
+            ++dark_pixels;
+          }
+        }
+      }
+      const double dark_ratio = surround_pixels > 0 ?
+        static_cast<double>(dark_pixels) / static_cast<double>(surround_pixels) : 0.0;
+      if (dark_ratio < traffic_light_.dark_surround_min) {
+        continue;
+      }
+      if (!best.valid || area > best.area_px) {
+        best.valid = true;
+        best.bounding_box = cv::Rect(x, y, width, height);
+        best.area_px = area;
+        best.dark_surround_ratio = dark_ratio;
+      }
+    }
+    return best;
+  }
+
+  void reset_traffic_light_gate()
+  {
+    traffic_green_confirm_count_ = 0;
+    traffic_green_released_ = !traffic_light_.enabled;
+    traffic_vehicle_started_ = false;
+    traffic_red_detected_ = false;
+    traffic_green_detected_ = false;
+    traffic_light_state_ = traffic_light_.enabled ? "UNKNOWN" : "DISABLED";
+  }
+
+  void update_traffic_light_gate(const cv::Mat & source_image)
+  {
+    source_image.copyTo(original_debug_image_);
+    const cv::Rect roi = traffic_light_roi(source_image.size());
+    const cv::Mat source_roi = source_image(roi);
+    cv::cvtColor(source_roi, traffic_hsv_roi_, cv::COLOR_BGR2HSV);
+    cv::inRange(
+      traffic_hsv_roi_,
+      cv::Scalar(0, traffic_light_.saturation_min, traffic_light_.value_min),
+      cv::Scalar(
+        traffic_light_.red_hue_low_max, 255, 255),
+      traffic_red_low_mask_);
+    cv::inRange(
+      traffic_hsv_roi_,
+      cv::Scalar(
+        traffic_light_.red_hue_high_min,
+        traffic_light_.saturation_min,
+        traffic_light_.value_min),
+      cv::Scalar(179, 255, 255),
+      traffic_red_high_mask_);
+    cv::bitwise_or(traffic_red_low_mask_, traffic_red_high_mask_, traffic_red_mask_);
+    cv::inRange(
+      traffic_hsv_roi_,
+      cv::Scalar(
+        traffic_light_.green_hue_min,
+        traffic_light_.saturation_min,
+        traffic_light_.value_min),
+      cv::Scalar(traffic_light_.green_hue_max, 255, 255),
+      traffic_green_mask_);
+    cv::morphologyEx(
+      traffic_red_mask_, traffic_red_mask_, cv::MORPH_OPEN, traffic_open_kernel_);
+    cv::morphologyEx(
+      traffic_green_mask_, traffic_green_mask_, cv::MORPH_OPEN, traffic_open_kernel_);
+
+    const TrafficLampDetection red = find_traffic_lamp_component(
+      traffic_red_mask_, traffic_hsv_roi_);
+    const TrafficLampDetection green = find_traffic_lamp_component(
+      traffic_green_mask_, traffic_hsv_roi_);
+    traffic_red_detected_ = red.valid;
+    traffic_green_detected_ = green.valid;
+
+    const std::string previous_state = traffic_light_state_;
+    if (!traffic_light_.enabled) {
+      traffic_green_released_ = true;
+      traffic_light_state_ = "DISABLED";
+    } else if (traffic_vehicle_started_) {
+      traffic_light_state_ = "RELEASED";
+    } else if (red.valid) {
+      // Red always wins over a simultaneous green candidate. A single valid
+      // red frame immediately closes the start gate.
+      traffic_green_confirm_count_ = 0;
+      traffic_green_released_ = false;
+      traffic_light_state_ = "RED";
+    } else if (green.valid) {
+      traffic_green_confirm_count_ = std::min(
+        traffic_green_confirm_count_ + 1, traffic_light_.green_confirm_frames);
+      traffic_green_released_ =
+        traffic_green_confirm_count_ >= traffic_light_.green_confirm_frames;
+      traffic_light_state_ = traffic_green_released_ ?
+        "GREEN" : "GREEN_CONFIRMING";
+    } else {
+      traffic_green_confirm_count_ = 0;
+      traffic_green_released_ = false;
+      traffic_light_state_ = "UNKNOWN";
+    }
+
+    if (traffic_light_state_ != previous_state) {
+      RCLCPP_INFO(
+        get_logger(), "Traffic light state: %s (red=%s, green=%s, confirm=%d/%d)",
+        traffic_light_state_.c_str(), red.valid ? "yes" : "no",
+        green.valid ? "yes" : "no", traffic_green_confirm_count_,
+        traffic_light_.green_confirm_frames);
+    }
+
+    const cv::Scalar roi_color = traffic_green_released_ ?
+      cv::Scalar(0, 255, 0) : cv::Scalar(0, 200, 255);
+    cv::rectangle(original_debug_image_, roi, roi_color, 2, cv::LINE_AA);
+    const auto draw_detection = [&](const TrafficLampDetection & detection,
+        const cv::Scalar & color) {
+        if (!detection.valid) {
+          return;
+        }
+        cv::Rect global_box = detection.bounding_box;
+        global_box.x += roi.x;
+        global_box.y += roi.y;
+        cv::rectangle(original_debug_image_, global_box, color, 2, cv::LINE_AA);
+      };
+    draw_detection(red, cv::Scalar(0, 0, 255));
+    draw_detection(green, cv::Scalar(0, 255, 0));
+    std::ostringstream signal_status;
+    signal_status << "SIGNAL " << traffic_light_state_ << " "
+                  << traffic_green_confirm_count_ << "/"
+                  << traffic_light_.green_confirm_frames;
+    cv::putText(
+      original_debug_image_, signal_status.str(),
+      cv::Point(roi.x, std::max(18, roi.y - 7)), cv::FONT_HERSHEY_SIMPLEX,
+      0.50, roi_color, 1, cv::LINE_AA);
   }
 
   void update_perspective_transform(uint32_t source_width, uint32_t source_height)
@@ -1990,6 +2376,10 @@ private:
     }
     last_speed_command_mps_ = speed_mps;
     last_steering_command_rad_ = steering_rad;
+    if (speed_mps > 1.0e-3 && traffic_light_.enabled && traffic_green_released_) {
+      traffic_vehicle_started_ = true;
+      traffic_light_state_ = "RELEASED";
+    }
   }
 
   void update_controller(
@@ -2003,6 +2393,13 @@ private:
       last_control_at_ = now;
       has_reliable_control_ = false;
       lost_frame_count_ = 0;
+      return;
+    }
+    if (traffic_light_.enabled && !traffic_green_released_) {
+      publish_control(0.0, 0.0);
+      controller_state_ = traffic_red_detected_ ?
+        "WAIT_TRAFFIC_RED" : "WAIT_TRAFFIC_GREEN";
+      last_control_at_ = now;
       return;
     }
     if (avoidance_.enabled && obstacle_data_stale_) {
@@ -2242,7 +2639,8 @@ private:
       cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
     std::ostringstream planner_status;
     planner_status << planner_state_ << "  offset=" << std::fixed << std::setprecision(2)
-                   << current_path_offset_m_ << "m  obstacles=" << latest_obstacles_.size();
+                   << current_path_offset_m_ << "m  obstacles=" << latest_obstacles_.size()
+                   << "  signal=" << traffic_light_state_;
     cv::putText(
       path_debug_image_, planner_status.str(), cv::Point(7, 60),
       cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(160, 220, 255), 1, cv::LINE_AA);
@@ -2274,9 +2672,14 @@ private:
           msg->width, msg->height, msg->encoding.c_str(), msg->header.frame_id.c_str());
       }
 
-      // Preserve the source encoding and timestamp. Later phases will publish
-      // additional ROI, bird's-eye and mask images on separate debug topics.
-      debug_original_pub_->publish(*msg);
+      // Traffic-light gating uses only the small right-side source-image ROI.
+      // The annotated copy is for debugging; the untouched working image is
+      // still used by BEV and lane perception.
+      update_traffic_light_gate(cv_image->image);
+      const auto original_debug_msg = cv_bridge::CvImage(
+        msg->header, sensor_msgs::image_encodings::BGR8,
+        original_debug_image_).toImageMsg();
+      debug_original_pub_->publish(*original_debug_msg);
 
       update_perspective_transform(msg->width, msg->height);
       const auto bev_started = std::chrono::steady_clock::now();
@@ -2466,6 +2869,23 @@ private:
   cv::Mat white_binary_mask_;
   cv::Mat white_open_kernel_;
   cv::Mat white_close_kernel_;
+  TrafficLightConfig traffic_light_;
+  cv::Mat original_debug_image_;
+  cv::Mat traffic_hsv_roi_;
+  cv::Mat traffic_red_low_mask_;
+  cv::Mat traffic_red_high_mask_;
+  cv::Mat traffic_red_mask_;
+  cv::Mat traffic_green_mask_;
+  cv::Mat traffic_open_kernel_;
+  cv::Mat traffic_component_labels_;
+  cv::Mat traffic_component_stats_;
+  cv::Mat traffic_component_centroids_;
+  int traffic_green_confirm_count_{0};
+  bool traffic_green_released_{false};
+  bool traffic_vehicle_started_{false};
+  bool traffic_red_detected_{false};
+  bool traffic_green_detected_{false};
+  std::string traffic_light_state_{"UNKNOWN"};
   PathDetectionConfig path_detection_;
   cv::Mat component_labels_;
   cv::Mat filtered_component_mask_;
