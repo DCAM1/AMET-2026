@@ -120,6 +120,15 @@ lane_follow:
     # Phase 10: local path offset. Obstacles are never accumulated into a map.
     obstacle_avoidance_enabled: true
     obstacle_timeout_sec: 0.60
+    # Maximum absolute timestamp difference allowed between the current camera
+    # frame and the latest obstacle array. This is separate from the obstacle
+    # subscriber timeout above.
+    max_obstacle_fusion_age_sec: 0.15
+    # Fixed simulator-only correction added to LiDAR obstacle centroids before
+    # comparing them with the BEV path. Forward positive: vehicle front.
+    # Lateral positive: vehicle left.
+    lidar_to_bev_forward_offset_m: 0.0
+    lidar_to_bev_lateral_offset_m: 0.0
     obstacle_min_forward_m: 0.25
     obstacle_passed_forward_m: -0.25
     obstacle_detection_distance_m: 1.50

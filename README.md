@@ -310,6 +310,10 @@ avoidance_speed_mps: 0.25
 | LiDAR | `angle_*_deg`, `range_*_m`, `cluster_distance_m` |
 | 회피 | `obstacle_detection_distance_m`, `obstacle_safety_distance_m`, `avoidance_lateral_offset_m` |
 
+- `max_obstacle_fusion_age_sec`: 카메라와 장애물 메시지 timestamp 차이 허용값
+- `lidar_to_bev_forward_offset_m`: LiDAR obstacle centroid에 더하는 전방 고정 offset
+- `lidar_to_bev_lateral_offset_m`: LiDAR obstacle centroid에 더하는 좌우 고정 offset
+
 ### 신호등 실차 보정
 
 기본 신호등 ROI는 시뮬레이터의 480x360 영상에 맞춰져 있습니다.
