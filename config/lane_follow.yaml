@@ -104,17 +104,17 @@ lane_follow:
     max_steering_rad: 0.349066
     max_steering_rate_rad_s: 1.80 #1.50
     test_speed_mps: 1.10 #0.40 
-    min_speed_mps: 0.60 
-    max_speed_mps: 1.3  #0.50
+    min_speed_mps: 0.85 
+    max_speed_mps: 1.6  #0.50
     steering_slowdown_threshold_rad: 0.10
-    curvature_slowdown_gain: 0.80
-    tracking_lane_confidence: 0.45
+    curvature_slowdown_gain: 0.58
+    tracking_lane_confidence: 0.40
     low_confidence_speed_mps: 0.20
-    previous_path_hold_sec: 0.35
-    lost_frame_threshold: 5
-    min_lookahead_distance_m: 0.25  #0.35 ->      -> 0.25
-    max_lookahead_distance_m: 0.45 #0.65  -> 0.60 -> 0.45
-    lookahead_speed_gain: 0.40  #0.55   ->       -> 0.40
+    previous_path_hold_sec: 1
+    lost_frame_threshold: 10
+    min_lookahead_distance_m: 0.3  #0.35 ->      -> 0.25
+    max_lookahead_distance_m: 0.5 #0.65  -> 0.60 -> 0.45
+    lookahead_speed_gain: 0.50  #0.55   ->       -> 0.40
     minimum_target_distance_m: 0.10
 
     # Phase 10: local path offset. Obstacles are never accumulated into a map.
@@ -143,7 +143,7 @@ lane_follow:
     avoidance_return_distance_m: 0.80  #회피 후 원래 차선으로 돌아가는 거리 
     obstacle_association_distance_m: 0.30
     obstacle_active_lost_timeout_sec: 0.25
-    avoidance_speed_mps: 0.60  # 장애물 회피 속도 0.25
+    avoidance_speed_mps: 0.80  # 장애물 회피 속도 0.25
     preferred_avoidance_side: left
 
     # Diagnostics.
