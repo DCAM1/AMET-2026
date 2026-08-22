@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <iomanip>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include <cv_bridge/cv_bridge.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <physicar_interfaces/msg/obstacle_array.hpp>
@@ -28,6 +30,14 @@
 #include <sensor_msgs/image_encodings.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2/exceptions.hpp>
+#include <tf2_ros/buffer.hpp>
+#include <tf2_ros/transform_listener.hpp>
+
+#include "physicar_autonomy/bev_geometry.hpp"
+#include "physicar_autonomy/local_candidate_planner.hpp"
+#include "physicar_autonomy/sensor_fusion_policy.hpp"
 
 namespace physicar_autonomy
 {
@@ -120,27 +130,34 @@ struct AvoidanceConfig
   bool enabled{true};
   double obstacle_timeout_sec{0.60};
   double max_obstacle_fusion_age_sec{0.15};
-  double lidar_to_bev_forward_offset_m{0.0};
-  double lidar_to_bev_lateral_offset_m{0.0};
+  std::string planning_frame{"base_footprint"};
+  std::string fixed_frame{"odom"};
+  double transform_timeout_sec{0.05};
+  int obstacle_history_size{12};
   double minimum_forward_m{0.25};
   double passed_forward_m{-0.25};
   double detection_distance_m{1.50};
   double safety_distance_m{0.14};
   double lateral_offset_m{0.27};
-  double offset_rate_mps{0.35};
-  double clear_time_sec{0.25};
-  double return_distance_m{0.80};
-  double association_distance_m{0.30};
-  double active_lost_timeout_sec{0.25};
+  int candidate_count{9};
+  double approach_distance_m{0.30};
+  double rejoin_distance_m{0.40};
+  double rejoin_tolerance_m{0.02};
+  double speed_recovery_rate_mps2{1.5};
   double avoidance_speed_mps{0.25};
   std::string preferred_side{"left"};
 };
 
-struct ObstaclePosition
+struct ObstacleSnapshot
 {
-  double forward_m{0.0};
-  double lateral_m{0.0};
-  bool valid{false};
+  physicar_interfaces::msg::ObstacleArray message;
+  std::chrono::steady_clock::time_point received_at;
+};
+
+struct TransformedObstacle
+{
+  physicar_interfaces::msg::Obstacle source;
+  PlanningObstacle planning;
 };
 
 struct ControlConfig
@@ -423,10 +440,14 @@ public:
       "obstacle_timeout_sec", 0.60);
     avoidance_.max_obstacle_fusion_age_sec = declare_parameter<double>(
       "max_obstacle_fusion_age_sec", 0.15);
-    avoidance_.lidar_to_bev_forward_offset_m = declare_parameter<double>(
-      "lidar_to_bev_forward_offset_m", 0.0);
-    avoidance_.lidar_to_bev_lateral_offset_m = declare_parameter<double>(
-      "lidar_to_bev_lateral_offset_m", 0.0);
+    avoidance_.planning_frame = declare_parameter<std::string>(
+      "obstacle_planning_frame", "base_footprint", topic_descriptor);
+    avoidance_.fixed_frame = declare_parameter<std::string>(
+      "obstacle_fixed_frame", "odom", topic_descriptor);
+    avoidance_.transform_timeout_sec = declare_parameter<double>(
+      "obstacle_transform_timeout_sec", 0.05);
+    avoidance_.obstacle_history_size = declare_parameter<int>(
+      "obstacle_history_size", 12);
     avoidance_.minimum_forward_m = declare_parameter<double>(
       "obstacle_min_forward_m", 0.25);
     avoidance_.passed_forward_m = declare_parameter<double>(
@@ -437,16 +458,16 @@ public:
       "obstacle_safety_distance_m", 0.14);
     avoidance_.lateral_offset_m = declare_parameter<double>(
       "avoidance_lateral_offset_m", 0.27);
-    avoidance_.offset_rate_mps = declare_parameter<double>(
-      "avoidance_offset_rate_mps", 0.35);
-    avoidance_.clear_time_sec = declare_parameter<double>(
-      "obstacle_clear_time_sec", 0.25);
-    avoidance_.return_distance_m = declare_parameter<double>(
-      "avoidance_return_distance_m", 0.80);
-    avoidance_.association_distance_m = declare_parameter<double>(
-      "obstacle_association_distance_m", 0.30);
-    avoidance_.active_lost_timeout_sec = declare_parameter<double>(
-      "obstacle_active_lost_timeout_sec", 0.25);
+    avoidance_.candidate_count = declare_parameter<int>(
+      "avoidance_candidate_count", 9);
+    avoidance_.approach_distance_m = declare_parameter<double>(
+      "avoidance_approach_distance_m", 0.30);
+    avoidance_.rejoin_distance_m = declare_parameter<double>(
+      "avoidance_rejoin_distance_m", 0.40);
+    avoidance_.rejoin_tolerance_m = declare_parameter<double>(
+      "avoidance_rejoin_tolerance_m", 0.02);
+    avoidance_.speed_recovery_rate_mps2 = declare_parameter<double>(
+      "avoidance_speed_recovery_rate_mps2", 1.5);
     avoidance_.avoidance_speed_mps = declare_parameter<double>(
       "avoidance_speed_mps", 0.25);
     avoidance_.preferred_side = declare_parameter<std::string>(
@@ -455,6 +476,9 @@ public:
     if (!validate_avoidance(avoidance_, path_detection_, avoidance_error)) {
       throw std::invalid_argument("Invalid obstacle avoidance parameters: " + avoidance_error);
     }
+
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     parameter_callback_ = add_on_set_parameters_callback(
       std::bind(&LaneFollowNode::on_parameters, this, std::placeholders::_1));
@@ -864,18 +888,18 @@ private:
       reason = "max_obstacle_fusion_age_sec must be within [0.01, 1.0]";
       return false;
     }
-    if (!std::isfinite(avoidance.lidar_to_bev_forward_offset_m) ||
-      avoidance.lidar_to_bev_forward_offset_m < -1.0 ||
-      avoidance.lidar_to_bev_forward_offset_m > 1.0)
-    {
-      reason = "lidar_to_bev_forward_offset_m must be within [-1.0, 1.0]";
+    if (avoidance.planning_frame.empty() || avoidance.fixed_frame.empty()) {
+      reason = "obstacle planning/fixed frames must not be empty";
       return false;
     }
-    if (!std::isfinite(avoidance.lidar_to_bev_lateral_offset_m) ||
-      avoidance.lidar_to_bev_lateral_offset_m < -1.0 ||
-      avoidance.lidar_to_bev_lateral_offset_m > 1.0)
+    if (!std::isfinite(avoidance.transform_timeout_sec) ||
+      avoidance.transform_timeout_sec < 0.001 || avoidance.transform_timeout_sec > 0.20)
     {
-      reason = "lidar_to_bev_lateral_offset_m must be within [-1.0, 1.0]";
+      reason = "obstacle_transform_timeout_sec must be within [0.001, 0.20]";
+      return false;
+    }
+    if (avoidance.obstacle_history_size < 2 || avoidance.obstacle_history_size > 50) {
+      reason = "obstacle_history_size must be within [2, 50]";
       return false;
     }
     if (avoidance.minimum_forward_m < 0.0 ||
@@ -902,22 +926,30 @@ private:
       reason = "avoidance_lateral_offset_m exceeds the configured lane half-width";
       return false;
     }
-    if (avoidance.offset_rate_mps <= 0.0 || avoidance.offset_rate_mps > 2.0) {
-      reason = "avoidance_offset_rate_mps must be within (0, 2.0]";
+    if (avoidance.candidate_count < 7 || avoidance.candidate_count > 11 ||
+      avoidance.candidate_count % 2 == 0)
+    {
+      reason = "avoidance_candidate_count must be an odd value within [7, 11]";
       return false;
     }
-    if (avoidance.clear_time_sec < 0.0 || avoidance.clear_time_sec > 5.0 ||
-      avoidance.return_distance_m < 0.1 || avoidance.return_distance_m > 5.0)
+    if (!std::isfinite(avoidance.approach_distance_m) ||
+      avoidance.approach_distance_m < 0.10 || avoidance.approach_distance_m > 1.50 ||
+      !std::isfinite(avoidance.rejoin_distance_m) ||
+      avoidance.rejoin_distance_m < 0.20 || avoidance.rejoin_distance_m > 1.50)
     {
-      reason = "avoidance clear time/return distance is outside safe bounds";
+      reason = "avoidance approach/rejoin distance is outside safe bounds";
       return false;
     }
-    if (avoidance.association_distance_m < 0.05 ||
-      avoidance.association_distance_m > 1.0 ||
-      avoidance.active_lost_timeout_sec < 0.05 ||
-      avoidance.active_lost_timeout_sec > 2.0)
+    if (!std::isfinite(avoidance.rejoin_tolerance_m) ||
+      avoidance.rejoin_tolerance_m < 0.005 || avoidance.rejoin_tolerance_m > 0.10)
     {
-      reason = "obstacle association distance/lost timeout is outside safe bounds";
+      reason = "avoidance_rejoin_tolerance_m must be within [0.005, 0.10]";
+      return false;
+    }
+    if (!std::isfinite(avoidance.speed_recovery_rate_mps2) ||
+      avoidance.speed_recovery_rate_mps2 < 0.10 || avoidance.speed_recovery_rate_mps2 > 5.0)
+    {
+      reason = "avoidance_speed_recovery_rate_mps2 must be within [0.10, 5.0]";
       return false;
     }
     if (avoidance.avoidance_speed_mps <= 0.0 || avoidance.avoidance_speed_mps > 3.0) {
@@ -1159,10 +1191,10 @@ private:
         candidate_avoidance.obstacle_timeout_sec = parameter.as_double();
       } else if (parameter.get_name() == "max_obstacle_fusion_age_sec") {
         candidate_avoidance.max_obstacle_fusion_age_sec = parameter.as_double();
-      } else if (parameter.get_name() == "lidar_to_bev_forward_offset_m") {
-        candidate_avoidance.lidar_to_bev_forward_offset_m = parameter.as_double();
-      } else if (parameter.get_name() == "lidar_to_bev_lateral_offset_m") {
-        candidate_avoidance.lidar_to_bev_lateral_offset_m = parameter.as_double();
+      } else if (parameter.get_name() == "obstacle_transform_timeout_sec") {
+        candidate_avoidance.transform_timeout_sec = parameter.as_double();
+      } else if (parameter.get_name() == "obstacle_history_size") {
+        candidate_avoidance.obstacle_history_size = static_cast<int>(parameter.as_int());
       } else if (parameter.get_name() == "obstacle_min_forward_m") {
         candidate_avoidance.minimum_forward_m = parameter.as_double();
       } else if (parameter.get_name() == "obstacle_passed_forward_m") {
@@ -1173,16 +1205,16 @@ private:
         candidate_avoidance.safety_distance_m = parameter.as_double();
       } else if (parameter.get_name() == "avoidance_lateral_offset_m") {
         candidate_avoidance.lateral_offset_m = parameter.as_double();
-      } else if (parameter.get_name() == "avoidance_offset_rate_mps") {
-        candidate_avoidance.offset_rate_mps = parameter.as_double();
-      } else if (parameter.get_name() == "obstacle_clear_time_sec") {
-        candidate_avoidance.clear_time_sec = parameter.as_double();
-      } else if (parameter.get_name() == "avoidance_return_distance_m") {
-        candidate_avoidance.return_distance_m = parameter.as_double();
-      } else if (parameter.get_name() == "obstacle_association_distance_m") {
-        candidate_avoidance.association_distance_m = parameter.as_double();
-      } else if (parameter.get_name() == "obstacle_active_lost_timeout_sec") {
-        candidate_avoidance.active_lost_timeout_sec = parameter.as_double();
+      } else if (parameter.get_name() == "avoidance_candidate_count") {
+        candidate_avoidance.candidate_count = static_cast<int>(parameter.as_int());
+      } else if (parameter.get_name() == "avoidance_approach_distance_m") {
+        candidate_avoidance.approach_distance_m = parameter.as_double();
+      } else if (parameter.get_name() == "avoidance_rejoin_distance_m") {
+        candidate_avoidance.rejoin_distance_m = parameter.as_double();
+      } else if (parameter.get_name() == "avoidance_rejoin_tolerance_m") {
+        candidate_avoidance.rejoin_tolerance_m = parameter.as_double();
+      } else if (parameter.get_name() == "avoidance_speed_recovery_rate_mps2") {
+        candidate_avoidance.speed_recovery_rate_mps2 = parameter.as_double();
       } else if (parameter.get_name() == "avoidance_speed_mps") {
         candidate_avoidance.avoidance_speed_mps = parameter.as_double();
       } else if (parameter.get_name() == "preferred_avoidance_side") {
@@ -1614,23 +1646,20 @@ private:
       return false;
     }
 
-    const double lane_width_ratio = 0.5 * (
-      perspective_.dst_top_right_x_ratio - perspective_.dst_top_left_x_ratio +
-      perspective_.dst_bottom_right_x_ratio - perspective_.dst_bottom_left_x_ratio);
-    const double lane_width_px = lane_width_ratio * static_cast<double>(image_size.width - 1);
-    if (lane_width_px <= 1.0) {
+    const BevGeometry geometry = bev_geometry(image_size.width, image_size.height);
+    if (!geometry.valid()) {
       return false;
     }
-    const double meters_per_pixel_x = path_detection_.lane_width_m / lane_width_px;
-    const double meters_per_pixel_y = path_detection_.bev_forward_range_m /
-      static_cast<double>(image_size.height - 1);
     const cv::Point2f vehicle_pixel(
       static_cast<float>(image_size.width - 1) * 0.5F,
       static_cast<float>(image_size.height - 1));
     const auto to_metric = [&](const cv::Point2f & point) {
-        return cv::Point2d(
-          (point.x - vehicle_pixel.x) * meters_per_pixel_x,
-          (vehicle_pixel.y - point.y) * meters_per_pixel_y);
+        const auto vehicle = geometry.bevPixelToVehicle(point.x, point.y);
+        return vehicle ?
+               cv::Point2d(-vehicle->lateral_left_m, vehicle->forward_m) :
+               cv::Point2d(
+          std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::quiet_NaN());
       };
     const auto metric_distance = [&](const cv::Point2f & first, const cv::Point2f & second) {
         const cv::Point2d delta = to_metric(second) - to_metric(first);
@@ -2151,145 +2180,200 @@ private:
   void on_obstacles(
     const physicar_interfaces::msg::ObstacleArray::ConstSharedPtr message)
   {
-    latest_obstacles_ = message->obstacles;
-    latest_obstacle_stamp_valid_ = message->header.stamp.sec >= 0 &&
-      message->header.stamp.nanosec < 1000000000U &&
-      (message->header.stamp.sec != 0 || message->header.stamp.nanosec != 0U);
-    latest_obstacle_stamp_ = latest_obstacle_stamp_valid_ ?
-      rclcpp::Time(message->header.stamp, RCL_ROS_TIME) :
-      rclcpp::Time(0, 0, RCL_ROS_TIME);
+    const auto received_at = std::chrono::steady_clock::now();
     latest_obstacle_frame_id_ = message->header.frame_id;
-    last_obstacle_message_at_ = std::chrono::steady_clock::now();
+    last_obstacle_message_at_ = received_at;
     received_obstacles_ = true;
+    obstacle_history_.push_back(ObstacleSnapshot{*message, received_at});
+    while (obstacle_history_.size() >
+      static_cast<std::size_t>(avoidance_.obstacle_history_size))
+    {
+      obstacle_history_.pop_front();
+    }
   }
 
-  ObstaclePosition obstacle_position_in_bev(
-    const physicar_interfaces::msg::Obstacle & obstacle) const
+  BevGeometry bev_geometry(int width, int height) const
   {
-    ObstaclePosition position;
-    position.forward_m = static_cast<double>(obstacle.centroid.x) +
-      avoidance_.lidar_to_bev_forward_offset_m;
-    position.lateral_m = static_cast<double>(obstacle.centroid.y) +
-      avoidance_.lidar_to_bev_lateral_offset_m;
-    position.valid = std::isfinite(position.forward_m) &&
-      std::isfinite(position.lateral_m);
-    return position;
-  }
-
-  double path_clearance_m(
-    const LaneFitResult & lane_fit, double lateral_offset_m,
-    const physicar_interfaces::msg::Obstacle ** nearest_collision = nullptr) const
-  {
-    if (nearest_collision != nullptr) {
-      *nearest_collision = nullptr;
-    }
-    if (lane_fit.sampled_path.empty()) {
-      return std::numeric_limits<double>::infinity();
-    }
     const double lane_width_ratio = 0.5 * (
       perspective_.dst_top_right_x_ratio - perspective_.dst_top_left_x_ratio +
       perspective_.dst_bottom_right_x_ratio - perspective_.dst_bottom_left_x_ratio);
-    const double meters_per_pixel_x = path_detection_.lane_width_m /
-      std::max(1.0, lane_width_ratio * (perspective_.output_width - 1));
-    const double meters_per_pixel_y = path_detection_.bev_forward_range_m /
-      std::max(1, perspective_.output_height - 1);
-    const double vehicle_x_px = 0.5 * static_cast<double>(perspective_.output_width - 1);
-    double minimum_clearance = std::numeric_limits<double>::infinity();
-    double nearest_collision_forward = std::numeric_limits<double>::infinity();
-    for (const auto & obstacle : latest_obstacles_) {
-      const ObstaclePosition position = obstacle_position_in_bev(obstacle);
-      if (!position.valid || !std::isfinite(obstacle.width) || obstacle.width < 0.0 ||
-        position.forward_m < avoidance_.minimum_forward_m ||
-        position.forward_m > avoidance_.detection_distance_m)
+    return BevGeometry(
+      width, height, lane_width_ratio * static_cast<double>(width - 1),
+      path_detection_.lane_width_m, path_detection_.bev_forward_range_m);
+  }
+
+  std::vector<VehiclePoint> pixels_to_vehicle(
+    const std::vector<cv::Point> & pixels, const BevGeometry & geometry) const
+  {
+    std::vector<VehiclePoint> result;
+    result.reserve(pixels.size());
+    for (const auto & pixel : pixels) {
+      const auto point = geometry.bevPixelToVehicle(pixel.x, pixel.y);
+      if (point) {
+        result.push_back(*point);
+      }
+    }
+    return result;
+  }
+
+  bool use_metric_path(
+    LaneFitResult & lane_fit, const std::vector<VehiclePoint> & path,
+    const BevGeometry & geometry) const
+  {
+    std::vector<cv::Point> pixels;
+    pixels.reserve(path.size());
+    double accumulated_m = 0.0;
+    double best_lookahead_error = std::numeric_limits<double>::infinity();
+    cv::Point lookahead;
+    bool have_lookahead = false;
+    VehiclePoint previous;
+    bool have_previous = false;
+    for (const auto & point : path) {
+      const auto pixel = geometry.vehicleToBevPixel(point.forward_m, point.lateral_left_m);
+      if (!pixel) {
+        continue;
+      }
+      if (have_previous) {
+        accumulated_m += std::hypot(
+          point.forward_m - previous.forward_m,
+          point.lateral_left_m - previous.lateral_left_m);
+      }
+      previous = point;
+      have_previous = true;
+      const cv::Point rounded(
+        static_cast<int>(std::lround(pixel->x)), static_cast<int>(std::lround(pixel->y)));
+      if (rounded.x < 0 || rounded.x >= geometry.width() ||
+        rounded.y < 0 || rounded.y >= geometry.height())
       {
         continue;
       }
-      double obstacle_clearance = std::numeric_limits<double>::infinity();
-      for (const auto & point : lane_fit.sampled_path) {
-        const double path_forward =
-          (perspective_.output_height - 1 - point.y) * meters_per_pixel_y;
-        const double path_lateral_left =
-          (vehicle_x_px - point.x) * meters_per_pixel_x + lateral_offset_m;
-        const double clearance = std::hypot(
-          position.forward_m - path_forward,
-          position.lateral_m - path_lateral_left) - 0.5 * obstacle.width;
-        obstacle_clearance = std::min(obstacle_clearance, clearance);
-      }
-      minimum_clearance = std::min(minimum_clearance, obstacle_clearance);
-      if (nearest_collision != nullptr &&
-        obstacle_clearance < avoidance_.safety_distance_m &&
-        position.forward_m < nearest_collision_forward)
-      {
-        *nearest_collision = &obstacle;
-        nearest_collision_forward = position.forward_m;
+      pixels.push_back(rounded);
+      const double error = std::abs(accumulated_m - effective_lookahead_distance_m());
+      if (error < best_lookahead_error) {
+        best_lookahead_error = error;
+        lookahead = rounded;
+        have_lookahead = true;
       }
     }
-    return minimum_clearance;
+    if (pixels.size() < 2U || !have_lookahead) {
+      return false;
+    }
+    lane_fit.sampled_path = std::move(pixels);
+    lane_fit.lookahead_point = lookahead;
+    return true;
   }
 
-  double obstacle_path_clearance_m(
-    const LaneFitResult & lane_fit,
-    const physicar_interfaces::msg::Obstacle & obstacle,
-    double lateral_offset_m) const
+  bool update_transformed_obstacles(
+    const rclcpp::Time & image_stamp,
+    const std::chrono::steady_clock::time_point & now)
   {
-    if (lane_fit.sampled_path.empty()) {
-      return std::numeric_limits<double>::infinity();
+    transformed_obstacles_.clear();
+    latest_sync_delta_valid_ = false;
+    obstacle_data_unsynced_ = false;
+    obstacle_tf_valid_ = false;
+    const double receipt_age = received_obstacles_ ?
+      std::chrono::duration<double>(now - last_obstacle_message_at_).count() :
+      std::numeric_limits<double>::infinity();
+    obstacle_data_stale_ = classify_sensor_fusion(
+      receipt_age, avoidance_.obstacle_timeout_sec, false, 0.0,
+      avoidance_.max_obstacle_fusion_age_sec, true) == SensorFusionStatus::kStale;
+    if (obstacle_data_stale_ || obstacle_history_.empty()) {
+      tf_status_ = "NO_LIDAR";
+      return false;
     }
-    const ObstaclePosition position = obstacle_position_in_bev(obstacle);
-    if (!position.valid || !std::isfinite(obstacle.width) || obstacle.width < 0.0) {
-      return std::numeric_limits<double>::infinity();
-    }
-    const double lane_width_ratio = 0.5 * (
-      perspective_.dst_top_right_x_ratio - perspective_.dst_top_left_x_ratio +
-      perspective_.dst_bottom_right_x_ratio - perspective_.dst_bottom_left_x_ratio);
-    const double meters_per_pixel_x = path_detection_.lane_width_m /
-      std::max(1.0, lane_width_ratio * (perspective_.output_width - 1));
-    const double meters_per_pixel_y = path_detection_.bev_forward_range_m /
-      std::max(1, perspective_.output_height - 1);
-    const double vehicle_x_px = 0.5 * static_cast<double>(perspective_.output_width - 1);
-    double minimum_clearance = std::numeric_limits<double>::infinity();
-    for (const auto & point : lane_fit.sampled_path) {
-      const double path_forward =
-        (perspective_.output_height - 1 - point.y) * meters_per_pixel_y;
-      const double path_lateral_left =
-        (vehicle_x_px - point.x) * meters_per_pixel_x + lateral_offset_m;
-      const double clearance = std::hypot(
-        position.forward_m - path_forward,
-        position.lateral_m - path_lateral_left) - 0.5 * obstacle.width;
-      minimum_clearance = std::min(minimum_clearance, clearance);
-    }
-    return minimum_clearance;
-  }
 
-  const physicar_interfaces::msg::Obstacle * nearest_base_path_collision(
-    const LaneFitResult & lane_fit, double & base_clearance) const
-  {
-    const physicar_interfaces::msg::Obstacle * nearest = nullptr;
-    base_clearance = path_clearance_m(lane_fit, 0.0, &nearest);
-    return nearest;
-  }
-
-  const physicar_interfaces::msg::Obstacle * associated_active_obstacle() const
-  {
-    const physicar_interfaces::msg::Obstacle * associated = nullptr;
-    double best_distance = avoidance_.association_distance_m;
-    for (const auto & obstacle : latest_obstacles_) {
-      const ObstaclePosition position = obstacle_position_in_bev(obstacle);
-      if (!position.valid || !std::isfinite(obstacle.width) || obstacle.width < 0.0 ||
-        position.forward_m < avoidance_.passed_forward_m ||
-        position.forward_m > avoidance_.detection_distance_m)
-      {
-        continue;
-      }
-      const double distance = std::hypot(
-        position.forward_m - active_obstacle_forward_m_,
-        position.lateral_m - active_obstacle_lateral_m_);
-      if (distance <= best_distance) {
-        associated = &obstacle;
-        best_distance = distance;
+    const bool image_stamp_valid = image_stamp.nanoseconds() != 0;
+    const auto valid_stamp = [](const auto & stamp) {
+        return stamp.sec >= 0 && stamp.nanosec < 1000000000U &&
+               (stamp.sec != 0 || stamp.nanosec != 0U);
+      };
+    const ObstacleSnapshot * selected = &obstacle_history_.back();
+    double best_delta = std::numeric_limits<double>::infinity();
+    if (image_stamp_valid) {
+      for (const auto & snapshot : obstacle_history_) {
+        if (!valid_stamp(snapshot.message.header.stamp)) {
+          continue;
+        }
+        const rclcpp::Time stamp(snapshot.message.header.stamp, RCL_ROS_TIME);
+        const double delta = std::abs((image_stamp - stamp).seconds());
+        if (std::isfinite(delta) && delta < best_delta) {
+          best_delta = delta;
+          selected = &snapshot;
+        }
       }
     }
-    return associated;
+    selected_obstacle_source_frame_ = selected->message.header.frame_id;
+    latest_obstacle_frame_id_ = selected_obstacle_source_frame_;
+    const bool obstacle_stamp_valid = valid_stamp(selected->message.header.stamp);
+    const rclcpp::Time obstacle_stamp = obstacle_stamp_valid ?
+      rclcpp::Time(selected->message.header.stamp, RCL_ROS_TIME) :
+      rclcpp::Time(0, 0, RCL_ROS_TIME);
+    if (image_stamp_valid && obstacle_stamp_valid && std::isfinite(best_delta)) {
+      latest_sync_delta_sec_ = best_delta;
+      latest_sync_delta_valid_ = true;
+      obstacle_data_unsynced_ = classify_sensor_fusion(
+        receipt_age, avoidance_.obstacle_timeout_sec, true, best_delta,
+        avoidance_.max_obstacle_fusion_age_sec, true) == SensorFusionStatus::kUnsynced;
+      if (obstacle_data_unsynced_) {
+        tf_status_ = "UNSYNCED";
+        return false;
+      }
+    }
+    if (selected_obstacle_source_frame_.empty()) {
+      tf_status_ = "MISSING_SOURCE_FRAME";
+      return false;
+    }
+    if (selected->message.obstacles.empty()) {
+      tf_status_ = "OK_EMPTY";
+      obstacle_tf_valid_ = true;
+      return true;
+    }
+
+    try {
+      geometry_msgs::msg::TransformStamped transform;
+      if (image_stamp_valid && obstacle_stamp_valid) {
+        transform = tf_buffer_->lookupTransform(
+          avoidance_.planning_frame, image_stamp,
+          selected_obstacle_source_frame_, obstacle_stamp,
+          avoidance_.fixed_frame,
+          rclcpp::Duration::from_seconds(avoidance_.transform_timeout_sec));
+      } else {
+        transform = tf_buffer_->lookupTransform(
+          avoidance_.planning_frame, selected_obstacle_source_frame_, tf2::TimePointZero,
+          tf2::durationFromSec(avoidance_.transform_timeout_sec));
+      }
+      for (const auto & obstacle : selected->message.obstacles) {
+        if (!std::isfinite(obstacle.centroid.x) || !std::isfinite(obstacle.centroid.y) ||
+          !std::isfinite(obstacle.centroid.z) || !std::isfinite(obstacle.width) ||
+          obstacle.width < 0.0)
+        {
+          continue;
+        }
+        geometry_msgs::msg::PointStamped source;
+        source.header = selected->message.header;
+        source.point = obstacle.centroid;
+        geometry_msgs::msg::PointStamped target;
+        tf2::doTransform(source, target, transform);
+        if (!std::isfinite(target.point.x) || !std::isfinite(target.point.y)) {
+          continue;
+        }
+        transformed_obstacles_.push_back(TransformedObstacle{
+          obstacle,
+          PlanningObstacle{
+            VehiclePoint{target.point.x, target.point.y},
+            0.5 * static_cast<double>(obstacle.width)}});
+      }
+      obstacle_tf_valid_ = true;
+      tf_status_ = "OK";
+      return true;
+    } catch (const tf2::TransformException & error) {
+      tf_status_ = "UNAVAILABLE";
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), steady_clock_, 2000,
+        "Obstacle TF %s -> %s at camera time unavailable: %s",
+        selected_obstacle_source_frame_.c_str(), avoidance_.planning_frame.c_str(), error.what());
+      return false;
+    }
   }
 
   void apply_obstacle_avoidance(
@@ -2298,199 +2382,126 @@ private:
     const rclcpp::Time & image_stamp)
   {
     lane_fit.base_sampled_path = lane_fit.sampled_path;
+    latest_candidate_plan_ = CandidatePlan{};
     latest_base_clearance_m_ = std::numeric_limits<double>::infinity();
-    latest_left_clearance_m_ = std::numeric_limits<double>::infinity();
-    latest_right_clearance_m_ = std::numeric_limits<double>::infinity();
-    latest_sync_delta_valid_ = false;
-    obstacle_data_unsynced_ = false;
-    const double obstacle_age_sec = received_obstacles_ ?
-      std::chrono::duration<double>(now - last_obstacle_message_at_).count() :
-      std::numeric_limits<double>::infinity();
-    obstacle_data_stale_ = avoidance_.enabled &&
-      obstacle_age_sec > avoidance_.obstacle_timeout_sec;
-    if (received_obstacles_ && latest_obstacle_stamp_valid_ && image_stamp.nanoseconds() != 0) {
-      const double sync_delta_sec = std::abs(
-        image_stamp.seconds() - latest_obstacle_stamp_.seconds());
-      if (std::isfinite(sync_delta_sec)) {
-        latest_sync_delta_sec_ = sync_delta_sec;
-        latest_sync_delta_valid_ = true;
-        obstacle_data_unsynced_ = avoidance_.enabled && !obstacle_data_stale_ &&
-          sync_delta_sec > avoidance_.max_obstacle_fusion_age_sec;
-      }
-    }
+    latest_min_clearance_m_ = std::numeric_limits<double>::infinity();
+    latest_max_candidate_curvature_ = 0.0;
+    remaining_rejoin_distance_m_ = 0.0;
+    obstacle_path_blocked_ = false;
+    avoidance_speed_limited_ = false;
+
     if (!avoidance_.enabled) {
-      current_path_offset_m_ = 0.0;
-      active_obstacle_valid_ = false;
-      obstacle_path_blocked_ = false;
+      obstacle_data_stale_ = false;
+      obstacle_data_unsynced_ = false;
+      obstacle_tf_valid_ = true;
       planner_state_ = "LANE_FOLLOW";
-      last_planner_at_ = now;
       return;
     }
-    if (obstacle_data_stale_) {
-      active_obstacle_valid_ = false;
-      planner_state_ = "LIDAR_STALE";
-      last_planner_at_ = now;
-      return;
-    }
-    if (obstacle_data_unsynced_) {
-      planner_state_ = "LIDAR_UNSYNCED";
-      last_planner_at_ = now;
-      RCLCPP_WARN_THROTTLE(
-        get_logger(), steady_clock_, 2000,
-        "Camera/LiDAR timestamp difference is %.1f ms (limit %.1f ms)",
-        latest_sync_delta_sec_ * 1000.0,
-        avoidance_.max_obstacle_fusion_age_sec * 1000.0);
+    if (!update_transformed_obstacles(image_stamp, now)) {
+      if (obstacle_data_stale_) {
+        planner_state_ = "LIDAR_STALE";
+      } else if (obstacle_data_unsynced_) {
+        planner_state_ = "LIDAR_UNSYNCED";
+      } else {
+        planner_state_ = "LIDAR_TF_UNAVAILABLE";
+      }
       return;
     }
 
-    const auto * collision_obstacle = nearest_base_path_collision(
-      lane_fit, latest_base_clearance_m_);
-    latest_left_clearance_m_ = path_clearance_m(
-      lane_fit, avoidance_.lateral_offset_m);
-    latest_right_clearance_m_ = path_clearance_m(
-      lane_fit, -avoidance_.lateral_offset_m);
-    const bool collision = latest_base_clearance_m_ < avoidance_.safety_distance_m;
-
-    if (active_obstacle_valid_) {
-      const auto * associated = associated_active_obstacle();
-      if (associated != nullptr) {
-        const ObstaclePosition position = obstacle_position_in_bev(*associated);
-        active_obstacle_forward_m_ = position.forward_m;
-        active_obstacle_lateral_m_ = position.lateral_m;
-        active_obstacle_last_seen_at_ = now;
-      } else {
-        const double unseen_age_sec = std::chrono::duration<double>(
-          now - active_obstacle_last_seen_at_).count();
-        if (unseen_age_sec > avoidance_.active_lost_timeout_sec) {
-          active_obstacle_valid_ = false;
-        }
-      }
+    const BevGeometry geometry = bev_geometry(
+      perspective_.output_width, perspective_.output_height);
+    const std::vector<VehiclePoint> base_path =
+      pixels_to_vehicle(lane_fit.sampled_path, geometry);
+    if (!lane_fit.valid || !geometry.valid() || base_path.size() < 3U) {
+      planner_state_ = "INVALID_LANE_PATH";
+      return;
     }
-
-    double target_offset_m = current_path_offset_m_;
-    if (active_obstacle_valid_) {
-      last_collision_at_ = now;
-      const bool avoiding_left = avoidance_direction_sign_ > 0.0;
-      const double selected_clearance = avoiding_left ?
-        latest_left_clearance_m_ : latest_right_clearance_m_;
-      const double opposite_clearance = avoiding_left ?
-        latest_right_clearance_m_ : latest_left_clearance_m_;
-      if (selected_clearance >= avoidance_.safety_distance_m) {
-        obstacle_path_blocked_ = false;
-        target_offset_m = avoidance_direction_sign_ * avoidance_.lateral_offset_m;
-        planner_state_ = avoiding_left ? "AVOID_LEFT" : "AVOID_RIGHT";
-      } else if (opposite_clearance >= avoidance_.safety_distance_m) {
-        avoidance_direction_sign_ = -avoidance_direction_sign_;
-        obstacle_path_blocked_ = false;
-        target_offset_m = avoidance_direction_sign_ * avoidance_.lateral_offset_m;
-        planner_state_ = avoidance_direction_sign_ > 0.0 ?
-          "AVOID_LEFT" : "AVOID_RIGHT";
-      } else {
-        obstacle_path_blocked_ = true;
-        target_offset_m = current_path_offset_m_;
-        planner_state_ = "OBSTACLE_BLOCKED";
-      }
-    } else if (collision) {
-      last_collision_at_ = now;
-      const bool left_safe = latest_left_clearance_m_ >= avoidance_.safety_distance_m;
-      const bool right_safe = latest_right_clearance_m_ >= avoidance_.safety_distance_m;
-      if (!left_safe && !right_safe) {
-        obstacle_path_blocked_ = true;
-        target_offset_m = current_path_offset_m_;
-        planner_state_ = "OBSTACLE_BLOCKED";
-      } else {
-        obstacle_path_blocked_ = false;
-        if (left_safe && !right_safe) {
-          avoidance_direction_sign_ = 1.0;
-        } else if (!left_safe && right_safe) {
-          avoidance_direction_sign_ = -1.0;
-        } else if ((!std::isfinite(latest_left_clearance_m_) &&
-          !std::isfinite(latest_right_clearance_m_)) ||
-          std::abs(latest_left_clearance_m_ - latest_right_clearance_m_) < 0.02)
-        {
-          avoidance_direction_sign_ = avoidance_.preferred_side == "left" ? 1.0 : -1.0;
-        } else {
-          avoidance_direction_sign_ =
-            latest_left_clearance_m_ > latest_right_clearance_m_ ? 1.0 : -1.0;
-        }
-        if (collision_obstacle == nullptr) {
-          obstacle_path_blocked_ = true;
-          target_offset_m = current_path_offset_m_;
-          planner_state_ = "OBSTACLE_BLOCKED";
-        } else {
-          const ObstaclePosition position = obstacle_position_in_bev(*collision_obstacle);
-          active_obstacle_valid_ = true;
-          active_obstacle_forward_m_ = position.forward_m;
-          active_obstacle_lateral_m_ = position.lateral_m;
-          active_obstacle_last_seen_at_ = now;
-          target_offset_m = avoidance_direction_sign_ * avoidance_.lateral_offset_m;
-          planner_state_ = avoidance_direction_sign_ > 0.0 ?
-            "AVOID_LEFT" : "AVOID_RIGHT";
-        }
-      }
-    } else {
-      obstacle_path_blocked_ = false;
-      const double clear_age_sec = std::chrono::duration<double>(
-        now - last_collision_at_).count();
-      if ((planner_state_ == "AVOID_LEFT" || planner_state_ == "AVOID_RIGHT") &&
-        clear_age_sec <= avoidance_.clear_time_sec)
+    std::vector<PlanningObstacle> planning_obstacles;
+    const double minimum_planning_forward = selected_avoidance_side_sign_ == 0 ?
+      avoidance_.minimum_forward_m : avoidance_.passed_forward_m;
+    for (const auto & obstacle : transformed_obstacles_) {
+      const double forward = obstacle.planning.center.forward_m;
+      if (forward >= minimum_planning_forward &&
+        forward <= avoidance_.detection_distance_m)
       {
-        target_offset_m = avoidance_direction_sign_ * avoidance_.lateral_offset_m;
-      } else if (std::abs(current_path_offset_m_) > 0.005) {
-        target_offset_m = 0.0;
-        planner_state_ = "RETURN_TO_LANE";
-      } else {
-        target_offset_m = 0.0;
-        current_path_offset_m_ = 0.0;
-        planner_state_ = "LANE_FOLLOW";
+        PlanningObstacle planning_obstacle = obstacle.planning;
+        planning_obstacle.collision_check = forward >= avoidance_.minimum_forward_m;
+        planning_obstacles.push_back(planning_obstacle);
       }
     }
+    for (const auto & obstacle : planning_obstacles) {
+      if (!obstacle.collision_check) {
+        continue;
+      }
+      double distance = std::numeric_limits<double>::infinity();
+      for (std::size_t i = 1; i < base_path.size(); ++i) {
+        distance = std::min(
+          distance, LocalCandidatePlanner::pointToSegmentDistance(
+            obstacle.center, base_path[i - 1], base_path[i]));
+      }
+      latest_base_clearance_m_ = std::min(
+        latest_base_clearance_m_, distance - obstacle.radius_m);
+    }
 
-    double elapsed_sec = std::chrono::duration<double>(now - last_planner_at_).count();
-    elapsed_sec = std::clamp(elapsed_sec, 0.0, 0.25);
-    double offset_rate = avoidance_.offset_rate_mps;
-    if (planner_state_ == "RETURN_TO_LANE") {
-      const double reference_speed = std::max(0.20, last_speed_command_mps_);
-      offset_rate = std::max(
-        0.05, avoidance_.lateral_offset_m * reference_speed /
-        avoidance_.return_distance_m);
+    const bool base_collision = latest_base_clearance_m_ < avoidance_.safety_distance_m;
+    const bool continue_active_avoidance =
+      selected_avoidance_side_sign_ != 0 && !planning_obstacles.empty();
+    if (!base_collision && !continue_active_avoidance) {
+      selected_avoidance_side_sign_ = 0;
+      current_path_offset_m_ = 0.0;
+      planner_state_ = "LANE_FOLLOW";
+      return;
     }
-    const double maximum_step = offset_rate * elapsed_sec;
-    if (current_path_offset_m_ < target_offset_m) {
-      current_path_offset_m_ = std::min(
-        current_path_offset_m_ + maximum_step, target_offset_m);
-    } else {
-      current_path_offset_m_ = std::max(
-        current_path_offset_m_ - maximum_step, target_offset_m);
-    }
-    last_planner_at_ = now;
 
-    const double lane_width_ratio = 0.5 * (
-      perspective_.dst_top_right_x_ratio - perspective_.dst_top_left_x_ratio +
-      perspective_.dst_bottom_right_x_ratio - perspective_.dst_bottom_left_x_ratio);
-    const double meters_per_pixel_x = path_detection_.lane_width_m /
-      std::max(1.0, lane_width_ratio * (perspective_.output_width - 1));
-    const int offset_pixels = static_cast<int>(std::lround(
-      current_path_offset_m_ / meters_per_pixel_x));
-    for (auto & point : lane_fit.sampled_path) {
-      point.x = std::clamp(point.x - offset_pixels, 0, perspective_.output_width - 1);
+    CandidatePlannerConfig config;
+    config.candidate_count = avoidance_.candidate_count;
+    config.maximum_lateral_offset_m = avoidance_.lateral_offset_m;
+    config.approach_distance_m = avoidance_.approach_distance_m;
+    config.rejoin_distance_m = avoidance_.rejoin_distance_m;
+    config.rejoin_tolerance_m = avoidance_.rejoin_tolerance_m;
+    config.obstacle_inflation_m = avoidance_.safety_distance_m;
+    config.maximum_curvature_per_m =
+      1.10 * std::tan(control_.max_steering_rad) / control_.wheelbase_m;
+    latest_candidate_plan_ = candidate_planner_.plan(
+      base_path, planning_obstacles, config,
+      selected_avoidance_side_sign_, current_path_offset_m_,
+      avoidance_.preferred_side == "left" ? 1 : -1);
+
+    for (const auto & candidate : latest_candidate_plan_.candidates) {
+      latest_max_candidate_curvature_ = std::max(
+        latest_max_candidate_curvature_, candidate.maximum_curvature_per_m);
     }
-    lane_fit.lookahead_point.x = std::clamp(
-      lane_fit.lookahead_point.x - offset_pixels, 0, perspective_.output_width - 1);
+    if (latest_candidate_plan_.blocked) {
+      obstacle_path_blocked_ = true;
+      planner_state_ = "OBSTACLE_BLOCKED";
+      return;
+    }
+    if (latest_candidate_plan_.selected_index < 0) {
+      planner_state_ = "INVALID_CANDIDATES";
+      return;
+    }
+
+    const CandidatePath & selected = latest_candidate_plan_.candidates[
+      static_cast<std::size_t>(latest_candidate_plan_.selected_index)];
+    if (!use_metric_path(lane_fit, selected.points, geometry)) {
+      planner_state_ = "INVALID_SELECTED_PATH";
+      return;
+    }
+    latest_min_clearance_m_ = selected.minimum_obstacle_clearance_m;
+    latest_max_candidate_curvature_ = selected.maximum_curvature_per_m;
+    remaining_rejoin_distance_m_ = latest_candidate_plan_.remaining_rejoin_distance_m;
+    selected_avoidance_side_sign_ = selected.target_offset_m > 1.0e-4 ? 1 :
+      (selected.target_offset_m < -1.0e-4 ? -1 : selected_avoidance_side_sign_);
+    current_path_offset_m_ = selected.target_offset_m;
+    avoidance_speed_limited_ = base_collision;
+    planner_state_ = selected_avoidance_side_sign_ >= 0 ? "AVOID_LEFT" : "AVOID_RIGHT";
 
     if (planner_state_ != last_logged_planner_state_) {
-      if (active_obstacle_valid_) {
-        RCLCPP_INFO(
-          get_logger(),
-          "Local planner state: %s (base clearance %.2f m, offset %.2f m, "
-          "active obstacle x=%.2f y=%.2f m)",
-          planner_state_.c_str(), latest_base_clearance_m_, current_path_offset_m_,
-          active_obstacle_forward_m_, active_obstacle_lateral_m_);
-      } else {
-        RCLCPP_INFO(
-          get_logger(), "Local planner state: %s (base clearance %.2f m, offset %.2f m)",
-          planner_state_.c_str(), latest_base_clearance_m_, current_path_offset_m_);
-      }
+      RCLCPP_INFO(
+        get_logger(),
+        "Local planner state: %s (base clearance %.2f m, selected %.2f m, TF %s)",
+        planner_state_.c_str(), latest_base_clearance_m_, selected.target_offset_m,
+        tf_status_.c_str());
       last_logged_planner_state_ = planner_state_;
     }
   }
@@ -2558,6 +2569,12 @@ private:
       last_control_at_ = now;
       return;
     }
+    if (avoidance_.enabled && !obstacle_tf_valid_) {
+      publish_control(0.0, 0.0);
+      controller_state_ = "LOST_LIDAR_TF";
+      last_control_at_ = now;
+      return;
+    }
     if (avoidance_.enabled && obstacle_path_blocked_) {
       publish_control(0.0, 0.0);
       controller_state_ = "OBSTACLE_BLOCKED";
@@ -2588,26 +2605,18 @@ private:
       return;
     }
 
-    const double lane_width_ratio = 0.5 * (
-      perspective_.dst_top_right_x_ratio - perspective_.dst_top_left_x_ratio +
-      perspective_.dst_bottom_right_x_ratio - perspective_.dst_bottom_left_x_ratio);
-    const double lane_width_px = lane_width_ratio *
-      static_cast<double>(perspective_.output_width - 1);
-    if (lane_width_px <= 1.0 || perspective_.output_height < 2) {
+    const BevGeometry geometry = bev_geometry(
+      perspective_.output_width, perspective_.output_height);
+    const auto target = geometry.bevPixelToVehicle(
+      lane_fit.lookahead_point.x, lane_fit.lookahead_point.y);
+    if (!target) {
       publish_control(0.0, 0.0);
       controller_state_ = "LOST_INVALID_GEOMETRY";
       last_control_at_ = now;
       return;
     }
-    const double meters_per_pixel_x = path_detection_.lane_width_m / lane_width_px;
-    const double meters_per_pixel_y = path_detection_.bev_forward_range_m /
-      static_cast<double>(perspective_.output_height - 1);
-    const double vehicle_x_px = static_cast<double>(perspective_.output_width - 1) * 0.5;
-    const double lateral_left_m =
-      (vehicle_x_px - lane_fit.lookahead_point.x) * meters_per_pixel_x;
-    const double forward_m =
-      (static_cast<double>(perspective_.output_height - 1) - lane_fit.lookahead_point.y) *
-      meters_per_pixel_y;
+    const double lateral_left_m = target->lateral_left_m;
+    const double forward_m = target->forward_m;
     const double target_distance_squared =
       forward_m * forward_m + lateral_left_m * lateral_left_m;
     if (!std::isfinite(target_distance_squared) ||
@@ -2651,10 +2660,18 @@ private:
         std::min(steering_speed, curvature_speed),
         control_.minimum_speed_mps, control_.maximum_speed_mps);
     }
-    if (avoidance_.enabled &&
-      (active_obstacle_valid_ || std::abs(current_path_offset_m_) > 0.005))
-    {
+    const double unconstrained_target_speed_mps = target_speed_mps;
+    if (avoidance_.enabled && avoidance_speed_limited_) {
       target_speed_mps = std::min(target_speed_mps, avoidance_.avoidance_speed_mps);
+      speed_recovery_active_ = true;
+    } else if (speed_recovery_active_) {
+      target_speed_mps = std::min(
+        target_speed_mps,
+        last_speed_command_mps_ + avoidance_.speed_recovery_rate_mps2 * elapsed_sec);
+      if (target_speed_mps >= unconstrained_target_speed_mps - 1.0e-3)
+      {
+        speed_recovery_active_ = false;
+      }
     }
 
     if (lane_reliable) {
@@ -2702,26 +2719,51 @@ private:
     for (const auto & point : lane_fit.detection_points) {
       cv::circle(path_debug_image_, point, 3, cv::Scalar(0, 255, 255), -1, cv::LINE_AA);
     }
-    const double lane_width_ratio = 0.5 * (
-      perspective_.dst_top_right_x_ratio - perspective_.dst_top_left_x_ratio +
-      perspective_.dst_bottom_right_x_ratio - perspective_.dst_bottom_left_x_ratio);
-    const double meters_per_pixel_x = path_detection_.lane_width_m /
-      std::max(1.0, lane_width_ratio * (path_debug_image_.cols - 1));
-    const double meters_per_pixel_y = path_detection_.bev_forward_range_m /
-      std::max(1, path_debug_image_.rows - 1);
-    for (const auto & obstacle : latest_obstacles_) {
-      const ObstaclePosition position = obstacle_position_in_bev(obstacle);
-      if (!position.valid || !std::isfinite(obstacle.width) || obstacle.width < 0.0 ||
-        position.forward_m < 0.0 ||
+    const BevGeometry geometry = bev_geometry(
+      path_debug_image_.cols, path_debug_image_.rows);
+    for (std::size_t index = 0; index < latest_candidate_plan_.candidates.size(); ++index) {
+      const auto & candidate = latest_candidate_plan_.candidates[index];
+      std::vector<cv::Point> candidate_pixels;
+      for (const auto & point : candidate.points) {
+        const auto pixel = geometry.vehicleToBevPixel(point.forward_m, point.lateral_left_m);
+        if (pixel && pixel->x >= 0.0 && pixel->x < path_debug_image_.cols &&
+          pixel->y >= 0.0 && pixel->y < path_debug_image_.rows)
+        {
+          candidate_pixels.emplace_back(
+            static_cast<int>(std::lround(pixel->x)),
+            static_cast<int>(std::lround(pixel->y)));
+        }
+      }
+      if (candidate_pixels.size() < 2U) {
+        continue;
+      }
+      const bool selected = static_cast<int>(index) == latest_candidate_plan_.selected_index;
+      const cv::Scalar color = selected ? cv::Scalar(0, 255, 0) :
+        (candidate.valid ? cv::Scalar(180, 180, 80) : cv::Scalar(80, 80, 220));
+      cv::polylines(
+        path_debug_image_, candidate_pixels, false, color, selected ? 3 : 1, cv::LINE_AA);
+      if (!candidate.valid && !candidate.rejection_reason.empty()) {
+        cv::putText(
+          path_debug_image_, candidate.rejection_reason.substr(0, 10),
+          candidate_pixels[candidate_pixels.size() / 2], cv::FONT_HERSHEY_SIMPLEX,
+          0.25, color, 1, cv::LINE_AA);
+      }
+    }
+    for (const auto & transformed : transformed_obstacles_) {
+      const auto & position = transformed.planning.center;
+      if (position.forward_m < 0.0 ||
         position.forward_m > path_detection_.bev_forward_range_m)
       {
         continue;
       }
+      const auto pixel = geometry.vehicleToBevPixel(
+        position.forward_m, position.lateral_left_m);
+      if (!pixel) {
+        continue;
+      }
       const cv::Point center(
-        static_cast<int>(std::lround(
-          0.5 * (path_debug_image_.cols - 1) - position.lateral_m / meters_per_pixel_x)),
-        static_cast<int>(std::lround(
-          (path_debug_image_.rows - 1) - position.forward_m / meters_per_pixel_y)));
+        static_cast<int>(std::lround(pixel->x)),
+        static_cast<int>(std::lround(pixel->y)));
       if (center.x < 0 || center.x >= path_debug_image_.cols ||
         center.y < 0 || center.y >= path_debug_image_.rows)
       {
@@ -2731,14 +2773,16 @@ private:
         path_debug_image_, center,
         cv::Size(
           static_cast<int>(std::lround(
-            (avoidance_.safety_distance_m + 0.5 * obstacle.width) / meters_per_pixel_x)),
+            (avoidance_.safety_distance_m + transformed.planning.radius_m) /
+            geometry.metersPerPixelX())),
           static_cast<int>(std::lround(
-            (avoidance_.safety_distance_m + 0.5 * obstacle.width) / meters_per_pixel_y))),
+            (avoidance_.safety_distance_m + transformed.planning.radius_m) /
+            geometry.metersPerPixelY()))),
         0.0, 0.0, 360.0, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
       cv::circle(path_debug_image_, center, 5, cv::Scalar(0, 0, 255), -1, cv::LINE_AA);
       std::ostringstream obstacle_label;
       obstacle_label << "x=" << std::fixed << std::setprecision(2) << position.forward_m
-                     << " y=" << position.lateral_m;
+                     << " y=" << position.lateral_left_m;
       cv::putText(
         path_debug_image_, obstacle_label.str(), center + cv::Point(6, -6),
         cv::FONT_HERSHEY_SIMPLEX, 0.34, cv::Scalar(0, 0, 255), 1, cv::LINE_AA);
@@ -2782,7 +2826,7 @@ private:
            << lane_fit.confidence << "  points=" << lane_fit.detection_points.size()
            << "  rms=" << std::setprecision(1) << lane_fit.residual_rms_px << "px";
     cv::rectangle(
-      path_debug_image_, cv::Rect(0, 0, path_debug_image_.cols, 88),
+      path_debug_image_, cv::Rect(0, 0, path_debug_image_.cols, 106),
       cv::Scalar(0, 0, 0), -1);
     cv::putText(
       path_debug_image_, status.str(), cv::Point(7, 20), cv::FONT_HERSHEY_SIMPLEX,
@@ -2796,9 +2840,9 @@ private:
       path_debug_image_, control_status.str(), cv::Point(7, 40),
       cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
     std::ostringstream planner_status;
-    planner_status << planner_state_ << "  offset=" << std::fixed << std::setprecision(2)
-                   << current_path_offset_m_ << "m  obstacles=" << latest_obstacles_.size()
-                   << "  signal=" << traffic_light_state_;
+    planner_status << planner_state_ << "  candidates="
+                   << latest_candidate_plan_.candidates.size() << "  obstacles="
+                   << transformed_obstacles_.size() << "  signal=" << traffic_light_state_;
     cv::putText(
       path_debug_image_, planner_status.str(), cv::Point(7, 60),
       cv::FONT_HERSHEY_SIMPLEX, 0.46, cv::Scalar(160, 220, 255), 1, cv::LINE_AA);
@@ -2823,14 +2867,24 @@ private:
     } else {
       sensor_status << "N/A";
     }
-    sensor_status << " frame=" << frame_id << " offset=(" << std::fixed
-                  << std::setprecision(2) << avoidance_.lidar_to_bev_forward_offset_m
-                  << "," << avoidance_.lidar_to_bev_lateral_offset_m << ") L="
-                  << clearance_text(latest_left_clearance_m_) << " R="
-                  << clearance_text(latest_right_clearance_m_);
+    sensor_status << " src=" << frame_id << " plan=" << avoidance_.planning_frame
+                  << " TF=" << tf_status_ << " clr="
+                  << clearance_text(latest_min_clearance_m_) << " k=" << std::fixed
+                  << std::setprecision(2) << latest_max_candidate_curvature_
+                  << " rejoin=" << remaining_rejoin_distance_m_;
     cv::putText(
       path_debug_image_, sensor_status.str(), cv::Point(7, 80),
       cv::FONT_HERSHEY_SIMPLEX, 0.37, cv::Scalar(200, 200, 200), 1, cv::LINE_AA);
+    std::ostringstream rejection_status;
+    rejection_status << "reject:";
+    for (const auto & candidate : latest_candidate_plan_.candidates) {
+      if (!candidate.valid && !candidate.rejection_reason.empty()) {
+        rejection_status << " " << candidate.rejection_reason;
+      }
+    }
+    cv::putText(
+      path_debug_image_, rejection_status.str().substr(0, 72), cv::Point(7, 99),
+      cv::FONT_HERSHEY_SIMPLEX, 0.32, cv::Scalar(160, 160, 220), 1, cv::LINE_AA);
   }
 
   void on_image(const sensor_msgs::msg::Image::ConstSharedPtr msg)
@@ -3033,6 +3087,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr steering_pub_;
   rclcpp::TimerBase::SharedPtr frame_watchdog_;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr parameter_callback_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
   std::chrono::steady_clock::time_point started_at_;
   std::chrono::steady_clock::time_point last_frame_at_;
@@ -3095,30 +3151,31 @@ private:
   std::string controller_state_{"DISABLED"};
   bool stale_stop_sent_{false};
   AvoidanceConfig avoidance_;
-  std::vector<physicar_interfaces::msg::Obstacle> latest_obstacles_;
-  rclcpp::Time latest_obstacle_stamp_{0, 0, RCL_ROS_TIME};
+  LocalCandidatePlanner candidate_planner_;
+  CandidatePlan latest_candidate_plan_;
+  std::deque<ObstacleSnapshot> obstacle_history_;
+  std::vector<TransformedObstacle> transformed_obstacles_;
   std::string latest_obstacle_frame_id_;
   std::chrono::steady_clock::time_point last_obstacle_message_at_{};
-  std::chrono::steady_clock::time_point last_collision_at_{};
-  std::chrono::steady_clock::time_point active_obstacle_last_seen_at_{};
-  std::chrono::steady_clock::time_point last_planner_at_{};
   double current_path_offset_m_{0.0};
-  double avoidance_direction_sign_{1.0};
-  double active_obstacle_forward_m_{0.0};
-  double active_obstacle_lateral_m_{0.0};
   double latest_sync_delta_sec_{0.0};
   double latest_base_clearance_m_{std::numeric_limits<double>::infinity()};
-  double latest_left_clearance_m_{std::numeric_limits<double>::infinity()};
-  double latest_right_clearance_m_{std::numeric_limits<double>::infinity()};
+  double latest_min_clearance_m_{std::numeric_limits<double>::infinity()};
+  double latest_max_candidate_curvature_{0.0};
+  double remaining_rejoin_distance_m_{0.0};
+  int selected_avoidance_side_sign_{0};
+  std::string selected_obstacle_source_frame_;
+  std::string tf_status_{"NO_DATA"};
   std::string planner_state_{"LANE_FOLLOW"};
   std::string last_logged_planner_state_;
   bool received_obstacles_{false};
-  bool latest_obstacle_stamp_valid_{false};
   bool latest_sync_delta_valid_{false};
   bool obstacle_data_stale_{true};
   bool obstacle_data_unsynced_{false};
+  bool obstacle_tf_valid_{false};
   bool obstacle_path_blocked_{false};
-  bool active_obstacle_valid_{false};
+  bool avoidance_speed_limited_{false};
+  bool speed_recovery_active_{false};
 };
 
 }  // namespace physicar_autonomy

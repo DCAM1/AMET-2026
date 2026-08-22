@@ -110,7 +110,7 @@ lane_follow:
     curvature_slowdown_gain: 0.58
     tracking_lane_confidence: 0.40
     low_confidence_speed_mps: 0.20
-    previous_path_hold_sec: 1
+    previous_path_hold_sec: 1.0
     lost_frame_threshold: 10
     min_lookahead_distance_m: 0.3  #0.35 ->      -> 0.25
     max_lookahead_distance_m: 0.5 #0.65  -> 0.60 -> 0.45
@@ -124,11 +124,10 @@ lane_follow:
     # frame and the latest obstacle array. This is separate from the obstacle
     # subscriber timeout above.
     max_obstacle_fusion_age_sec: 0.15
-    # Fixed simulator-only correction added to LiDAR obstacle centroids before
-    # comparing them with the BEV path. Forward positive: vehicle front.
-    # Lateral positive: vehicle left.
-    lidar_to_bev_forward_offset_m: 0.0
-    lidar_to_bev_lateral_offset_m: 0.0
+    obstacle_planning_frame: base_footprint
+    obstacle_fixed_frame: odom
+    obstacle_transform_timeout_sec: 0.05
+    obstacle_history_size: 12
     obstacle_min_forward_m: 0.25
     obstacle_passed_forward_m: -0.25
     obstacle_detection_distance_m: 1.50
@@ -136,13 +135,11 @@ lane_follow:
     # verified from the simulator model, plus margin.
     obstacle_safety_distance_m: 0.14   #장애물 주변 추가 안전 여유 
     avoidance_lateral_offset_m: 0.20  #장애물 회피시 차선 offset #0.27
-    avoidance_offset_rate_mps: 0.35
-    # Track one cone until it leaves the front scan, then choose a fresh side
-    # for the next cone. This is required for alternating slalom placement.
-    obstacle_clear_time_sec: 0.25
-    avoidance_return_distance_m: 0.80  #회피 후 원래 차선으로 돌아가는 거리 
-    obstacle_association_distance_m: 0.30
-    obstacle_active_lost_timeout_sec: 0.25
+    avoidance_candidate_count: 9
+    avoidance_approach_distance_m: 0.30
+    avoidance_rejoin_distance_m: 0.40
+    avoidance_rejoin_tolerance_m: 0.02
+    avoidance_speed_recovery_rate_mps2: 1.5
     avoidance_speed_mps: 0.80  # 장애물 회피 속도 0.25
     preferred_avoidance_side: left
 
