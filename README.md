@@ -1,4 +1,4 @@
-# AME2026 PhysiCar Autonomy
+# 2026 Autonomy
 
 Raspberry Pi 5와 ROS 2 Jazzy를 대상으로 만든 OpenCV 기반 PhysiCar 대회용
 자율주행 패키지입니다. SLAM, 전역 지도 localization, 딥러닝 차선 검출은
